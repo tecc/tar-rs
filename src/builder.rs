@@ -225,6 +225,48 @@ impl<W: Write> Builder<W> {
         EntryWriter::start(self.get_mut(), header, path.as_ref())
     }
 
+    /// Adds a new entry to this archive and returns an [`UnseekingEntryWriter`] for
+    /// adding its contents.
+    ///
+    /// This function is similar to [`Self::append_data`] but returns a
+    /// [`io::Write`] implementation instead of taking data as a parameter.
+    ///
+    /// Similar constraints around the position of the archive and completion
+    /// apply as with [`Self::append_data`].
+    ///
+    /// Unlike [`Self::append_writer`], this function does not require you to have
+    /// the underyling writer implement [`io::Seek`], in exchange for having to set
+    /// the entry size on the header in advance (using [`Header::set_size`]).
+    ///
+    /// # Errors
+    ///
+    /// This function will return an error for any intermittent I/O error which
+    /// occurs when either reading or writing.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::io::Cursor;
+    /// use std::io::Write as _;
+    /// use tar::{Builder, Header};
+    ///
+    /// let content = b"Hello there!";
+    /// let mut header = Header::new_gnu();
+    /// header.set_size(content.len() as u64);
+    ///
+    /// let mut ar = Builder::new(Cursor::new(Vec::new()));
+    /// let mut entry = ar.append_writer_unseeking(&mut header, "hi.txt").unwrap();
+    /// entry.write_all(content).unwrap();
+    /// entry.finish().unwrap();
+    /// ```
+    pub fn append_writer_unseeking<'a, P: AsRef<Path>>(
+        &'a mut self,
+        header: &mut Header,
+        path: P
+    ) -> io::Result<UnseekingEntryWriter<'a>> {
+        UnseekingEntryWriter::start(self.get_mut(), header, path.as_ref())
+    }
+
     /// Adds a new link (symbolic or hard) entry to this archive with the specified path and target.
     ///
     /// This function is similar to [`Self::append_data`] which supports long filenames,
@@ -492,6 +534,78 @@ trait SeekWrite: Write + Seek {
 impl<T: Write + Seek> SeekWrite for T {
     fn as_write(&mut self) -> &mut dyn Write {
         self
+    }
+}
+
+/// A writer for a single entry in a tar archive that doesn't need to seek.
+///
+/// This struct is returned by [`Builder::append_writer_unseeking`] and provides a
+/// [`Write`] implementation for adding content to an archive entry.
+///
+/// After writing all data to the entry, it must be finalized either by
+/// explicitly calling [`UnseekingEntryWriter::finish`] or by letting it drop.
+pub struct UnseekingEntryWriter<'a> {
+    obj: &'a mut dyn Write,
+    written: u64,
+}
+
+impl UnseekingEntryWriter<'_> {
+    fn start<'a>(
+        obj: &'a mut dyn Write,
+        header: &mut Header,
+        path: &Path,
+    ) -> io::Result<UnseekingEntryWriter<'a>> {
+        prepare_header_path(obj, header, path)?;
+
+        obj.write_all(header.as_bytes())?;
+
+        Ok(UnseekingEntryWriter {
+            obj,
+            written: 0,
+        })
+    }
+
+
+    /// Finish writing the current entry in the archive.
+    pub fn finish(self) -> io::Result<()> {
+        // NOTE: This is an optimization for "fallible destructuring".
+        // We want finish() to return an error, but we also need to invoke
+        // cleanup in our Drop handler, which will run unconditionally
+        // and try to do the same work.
+        // By using ManuallyDrop, we suppress that drop. However, this would
+        // be a memory leak if we ever had any struct members which required
+        // Drop - which we don't right now.
+        // But if we ever gain one, we will need to change to use e.g. Option<>
+        // around some of the fields or have a `bool finished` etc.
+        let mut this = std::mem::ManuallyDrop::new(self);
+        this.do_finish()
+    }
+
+    fn do_finish(&mut self) -> io::Result<()> {
+        // Pad with zeros if necessary.
+        let buf = [0u8; BLOCK_SIZE as usize];
+        let remaining = BLOCK_SIZE.wrapping_sub(self.written) % BLOCK_SIZE;
+        self.obj.write_all(&buf[..remaining as usize])?;
+
+        Ok(())
+    }
+}
+
+impl Write for UnseekingEntryWriter<'_> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        let len = self.obj.write(buf)?;
+        self.written += len as u64;
+        Ok(len)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.obj.flush()
+    }
+}
+
+impl Drop for UnseekingEntryWriter<'_> {
+    fn drop(&mut self) {
+        let _ = self.do_finish();
     }
 }
 
