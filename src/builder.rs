@@ -259,11 +259,11 @@ impl<W: Write> Builder<W> {
     /// entry.write_all(content).unwrap();
     /// entry.finish().unwrap();
     /// ```
-    pub fn append_writer_unseeking<'a, P: AsRef<Path>>(
-        &'a mut self,
+    pub fn append_writer_unseeking<P: AsRef<Path>>(
+        &mut self,
         header: &mut Header,
         path: P
-    ) -> io::Result<UnseekingEntryWriter<'a>> {
+    ) -> io::Result<UnseekingEntryWriter> {
         UnseekingEntryWriter::start(self.get_mut(), header, path.as_ref())
     }
 
@@ -556,8 +556,10 @@ impl UnseekingEntryWriter<'_> {
         path: &Path,
     ) -> io::Result<UnseekingEntryWriter<'a>> {
         prepare_header_path(obj, header, path)?;
+        header.set_cksum();
 
         obj.write_all(header.as_bytes())?;
+
 
         Ok(UnseekingEntryWriter {
             obj,
